@@ -1,0 +1,389 @@
+suppressPackageStartupMessages(library(dplyr))
+suppressPackageStartupMessages(library(data.table))
+suppressPackageStartupMessages(library(stringr))
+setwd("Duplications")
+duplications <- read.csv('Duplications_new.tsv', sep='\t', strip.white=T) %>% tbl_df
+
+# First thing is we tell R that Type is an ordered factor.
+# That way we can sort them non-terminal first later (code block 6 or so)
+# I don't know what the STRIDE thing means yet. It's probably related to this algorithm:
+# https://www.ncbi.nlm.nih.gov/pmc/articles/PMC5850722/
+duplications$Type <- ordered(duplications$Type,
+                             levels=c('Non-Terminal', 'Non-Terminal: STRIDE', 'Terminal'))
+duplications <- duplications %>% arrange(Type)
+
+#example <- read.csv('Post_R_processing_example_spreadsheet.csv', sep=',', strip.white=T, header=T) %>% tbl_df
+
+duplications %>% head(n=5)
+
+duplications_orthogroups <- duplications %>% select(-Genes.1, -Genes.2) %>% distinct
+duplications_orthogroups
+
+# Before trying to order oldest first, we need to make a numeric node_number column.
+# This fixes the issue that for example N11 will sort alphabetically before N2.
+# Once we have that we can order everything correctly by node_number
+# along with the Type column we made before.
+duplications_orthogroups <- duplications_orthogroups %>%
+    mutate(node_number=as.numeric(substring(Species.Tree.Node, 2))) %>%
+    arrange(Orthogroup, Type, node_number)
+
+# Next we do the support filtering step
+duplications_orthogroups_supported <- duplications_orthogroups %>% filter(Support >= 0.5)
+
+# And finally we keep only the first row from each orthogroup,
+# which should be the oldest supported one.
+duplications_orthogroups_oldest_supported <- duplications_orthogroups_supported %>%
+    group_by(Orthogroup) %>% slice(1) %>% ungroup
+
+duplications_orthogroups_oldest_supported
+
+duplications_genes <- duplications %>%
+    dplyr::mutate(genes = strsplit(paste(Genes.1, Genes.2, sep=","), ",")) %>%
+    select(-Genes.1, -Genes.2) %>%
+    tidyr::unnest(genes) %>%
+    mutate(genes=str_trim(genes)) %>% distinct # fix for duplicate gene IDs caused by trailing spaces
+
+duplications_genes
+
+duplications_genes_only <- duplications_genes %>% select(genes, Orthogroup)
+duplications_genes_only
+
+#attempt1 <- function(protein_ids)
+#    gsub('.*_', '', gsub('\\..{1,8}$', '', protein_ids))
+
+#attempt2 <- function(protein_ids)
+#    gsub('.*\\(([A-Z][a-z]{3,}\\)).*', '\\1', protein_ids)
+
+#attempt3 <- function(protein_ids)
+#    regmatches(protein_ids, regexec('.*\\(([A-Z][a-z]{3,}\\)).*'), protein_ids)
+
+#require(stringr)
+
+#attempt4 <- function(protein_ids)
+#    str_match(protein_ids, "_([A-Z][a-z]{1,}\\.?[A-Za-z0-9_]*)")[,2]
+
+shortids <- function(protein_ids)
+    gsub("_[0-9]*$", "",
+         str_match(protein_ids, "_([A-Z][a-z]{1,}\\.?[A-Za-z0-9_]*)")[,2])
+
+duplications_genes_shortids <- duplications_genes_only %>%
+    mutate(gene_id=shortids(genes)) %>%
+    transmute(Orthogroup=Orthogroup, protein_id=genes, gene=gene_id)
+
+duplications_genes_shortids
+
+all_protein_ids <- paste(duplications$Genes.1, duplications$Genes.2, sep=',') %>%
+    strsplit(',') %>% unlist %>% str_trim %>% unique
+
+all_protein_ids
+
+all_protein_ids %>% unique %>% length
+
+all_protein_ids %>% shortids %>% unique %>% length
+
+problem_ids <- all_protein_ids[grep('(ChrUn|ChrSy)', all_protein_ids)] %>% unique
+
+problem_ids
+
+problem_ids %>% length
+
+# takes a shortids function and makes a table of its inputs + outputs
+shortid_debug_table <- function(shortid_fn)
+    data.table(protein_id=all_protein_ids, gene_id=shortid_fn(all_protein_ids)) %>%
+    tbl_df %>%
+    group_by(gene_id) %>%
+    distinct() %>%
+    mutate(n_dups=n()) %>%
+    ungroup %>%
+    filter(n_dups > 1) %>%
+    arrange(desc(n_dups), protein_id)
+
+shortid_debug_table(shortids)
+
+shortids_fix1 <- function(protein_ids)
+    gsub("_[0-9]*$", "",
+    str_match(gsub('(ChrUn|ChrSy)\\.', '\\1',
+    gsub('\\.mRNA\\.', 'mRNA', protein_ids)),
+    "_([A-Z][a-z]{1,}\\.?[A-Za-z0-9_]*)")[,2])
+
+shortid_debug_table(shortids_fix1)
+
+shortids_fix2 <- function(protein_ids)
+    gsub('\\.p$', '',
+    gsub("_[0-9]*$", "",
+    str_match(gsub('(ChrUn|ChrSy)\\.', '\\1',
+    gsub('\\.mRNA\\.', 'mRNA', protein_ids)),
+    "_([A-Z][a-z]{1,}\\.?[A-Za-z0-9_\\.]*)")[,2]))
+
+shortid_debug_table(shortids_fix2)
+
+all_protein_ids %>% unique %>% length
+
+all_protein_ids %>% shortids_fix2 %>% unique %>% length
+
+# for simpler code at the expense of runtime, we just add another filter step on top
+shortids_fix3 <- function(protein_ids)
+    gsub('\\.[0-9]*$', '', 
+    gsub('\\.p$', '',
+    gsub("_[0-9]*$", "",
+    str_match(gsub('(ChrUn|ChrSy)\\.', '\\1',
+    gsub('\\.mRNA\\.', 'mRNA', protein_ids)),
+    "_([A-Z][a-z]{1,}\\.?[A-Za-z0-9_\\.]*)")[,2])))
+
+shortid_debug_table(shortids_fix3)
+
+duplications_genes_shortids <- duplications_genes_only %>%
+    mutate(gene_id=shortids_fix3(genes)) %>%
+    transmute(Orthogroup=Orthogroup, protein_id=genes, gene=gene_id)
+
+duplications_genes_shortids
+
+lookup_genes <- function(orthogroup_name)
+    duplications_genes_shortids %>% filter(Orthogroup == orthogroup_name) %>% .[["gene"]] %>% unique
+
+lookup_genes("OG0000005")
+
+lookup_orthogroups <- function(gene_name)
+    duplications_genes_shortids %>% filter(gene == gene_name) %>% .[["Orthogroup"]] %>% unique
+
+#lookup_orthogroups('Sbicolor_454_v3_1_1_protein_Sobic.001G297600.2.p')
+#lookup_orthogroups('Sobic.001G297600.2')
+lookup_orthogroups('Sobic.001G297600')
+
+lookup_orthogroups_info <- function(gene_name)
+    duplications_orthogroups_oldest_supported %>% filter(Orthogroup %in% lookup_orthogroups(gene_name))
+
+#lookup_orthogroups_info("Osativa_323_v7_0_protein_LOC_Os11g35762.1")
+lookup_orthogroups_info("Os11g35762")
+
+#write.table(duplications_orthogroups_oldest_supported,
+#            file='duplications_orthogroups_oldest_supported.tsv',
+#            sep='\t', row.names=F, quote=F)
+
+#write.table(duplications_genes_shortids,
+#            file='duplications_genes_shortids.tsv',
+#            sep='\t', row.names=F, quote=F)
+
+write_tsv <- function(df, filename)
+    write.table(df, file=filename, sep='\t', row.names=F, quote=F)
+
+write_tsv(duplications_orthogroups_oldest_supported, 'duplications_orthogroups_oldest_supported.tsv')
+write_tsv(duplications_genes_shortids, 'duplications_genes_shortids.tsv')
+
+insertions <- read.csv('tdna-insertions.tsv', strip.white=T, sep='\t') %>% tbl_df
+
+# now a simpler version of the same trick we did above with the genes
+insertions <- insertions %>%
+    dplyr::mutate(tdna_line = strsplit(tdna_line, ",")) %>%
+    tidyr::unnest(tdna_line) %>%
+    mutate(tdna_line=str_trim(tdna_line)) %>% distinct
+
+insertions
+
+# and a function to look up insertion lines for a given gene
+lookup_tdna_lines <- function(gene_name)
+    insertions %>% filter(gene_tagged == gene_name) %>% select(-gene_tagged)
+
+lookup_tdna_lines('Bradi1g00260')
+
+# a variant for when we have a list of genes
+lookup_tdna_lines_multi <- function(gene_names)
+        insertions %>% filter(gene_tagged %in% gene_names) %>% arrange(gene_tagged, insert_class)
+
+lookup_tdna_lines_multi(c('Bradi1g00227', 'Bradi1g00247', 'Bradi1g00260'))
+
+# maybe we also want to know which genes we have lots of insertions for?
+count_tdna_lines <- function(gene_names)
+    lookup_tdna_lines_multi(gene_names) %>%
+    group_by(gene_tagged) %>% summarize(n_tdna_lines=n()) %>% ungroup %>%
+    arrange(desc(n_tdna_lines))
+
+count_tdna_lines(c('Bradi1g00227', 'Bradi1g00247', 'Bradi1g00260'))
+
+# Since we're keeping Genes.1 and .2 separate, it works better to split into two tables here.
+# We want one column with the gene id and another saying whether it was from the Genes.1 or Genes.2 branch.
+# Then we have a fairly simple structure we can do filtering on to ask questions about which genes were
+# in Genes.1 or .2 at different nodes.
+
+tmp1 <- duplications %>%
+    select(-Genes.2) %>%
+    dplyr::mutate(Gene = strsplit(as.character(Genes.1), split=",")) %>%
+    select(-Genes.1) %>%
+    tidyr::unnest(Gene) %>%
+    mutate(Genes=str_trim(Gene)) %>% distinct %>%
+    mutate(Branch = 1)
+
+tmp2 <- duplications %>%
+    select(-Genes.1) %>%
+    dplyr::mutate(Gene = strsplit(as.character(Genes.2), split=",")) %>%
+    select(-Genes.2) %>%
+    tidyr::unnest(Gene) %>%
+    mutate(Genes=str_trim(Gene)) %>% distinct %>%
+    mutate(Branch = 2)
+
+# remember to update the shortids_fixN function here too
+duplications_long <- rbind(tmp1, tmp2) %>% mutate(Gene=shortids_fix3(Gene)) %>% distinct
+rm(tmp1, tmp2)
+
+duplications_long
+
+lookup_tree_info <- function(gene_name)
+    duplications_long %>%
+    filter(Gene == gene_name, Type != 'Terminal') %>% # can be 'Non-Terminal' or 'Non-Terminal: STRIDE'
+    select(Species.Tree.Node, Gene.Tree.Node, Support, Branch) %>%
+    arrange(Species.Tree.Node, Branch) %>%
+    distinct
+
+#lookup_orthogroups('Sobic.001G297600.2')
+#lookup_tree_info('Sobic.001G297600.2')
+
+lookup_orthogroups('Sobic.001G297600')
+lookup_tree_info('Sobic.001G297600')
+
+n_orthogroups <- duplications_long %>%
+    filter(Support > 0.95) %>% # same pattern appears with different numbers here
+    select(Orthogroup, Gene, Support) %>% distinct() %>%
+    group_by(Gene) %>% mutate(N.Orthogroups=n()) %>% ungroup %>%
+    arrange(desc(N.Orthogroups), desc(Support), Gene, Orthogroup)
+
+n_orthogroups
+
+duplications_long %>% filter(grepl('Bradi1g15290', Gene)) %>% distinct
+
+duplications_long %>% filter(grepl('Bradi1g15290', Gene), Type != 'Terminal') %>% distinct
+
+n_orthogroups_fixed <- duplications_long %>%
+    filter(Type != 'Terminal') %>%
+    filter(Support > 0.95) %>% # same pattern appears with different numbers here
+    select(Orthogroup, Gene, Support) %>% distinct() %>%
+    group_by(Gene) %>% mutate(N.Orthogroups=n()) %>% ungroup %>%
+    arrange(desc(N.Orthogroups), desc(Support), Gene, Orthogroup)
+
+n_orthogroups_fixed
+
+duplications_long %>%
+    select(-Genes) %>%
+    filter(Type != 'Terminal') %>% # can be 'Non-Terminal' or 'Non-Terminal: STRIDE
+    filter(grepl('^(Sobic|Bradi)', Gene)) %>%
+    group_by(Orthogroup, Species.Tree.Node) %>%
+    mutate(Orthogroup.N.Genes = n()) %>%
+    filter(Orthogroup.N.Genes == 2) %>%
+    arrange(Orthogroup, Gene)
+
+# first, a function to filter for each species individually
+# TODO name this something more descriptive
+filter_orthologs_species <- function(df, species_prefix)
+    df %>%
+    select(Orthogroup, Species.Tree.Node, Type, Gene) %>%
+    filter(Type != 'Terminal') %>% # can be 'Non-Terminal' or 'Non-Terminal: STRIDE'
+    filter(grepl(paste0('^', species_prefix), Gene)) %>%
+    group_by(Orthogroup, Species.Tree.Node) %>%
+    mutate(N.Genes = n()) %>%
+    ungroup %>%
+    distinct %>%
+    filter(N.Genes == 1) %>%
+    mutate(Species = species_prefix)
+
+filter_orthologs_species(duplications_long, 'Sobic')
+
+filter_orthologs_species(duplications_long, 'Bradi')
+
+filter_orthologs_pairs <- function(df, species1, species2) {
+    s1_genes <- filter_orthologs_species(df, species1)
+    s2_genes <- filter_orthologs_species(df, species2)
+    both_genes <- rbind(s1_genes, s2_genes) %>%
+        distinct %>%
+        group_by(Orthogroup, Species.Tree.Node) %>% mutate(N.Genes = n()) %>% ungroup %>%
+        filter(N.Genes == 2) %>%
+        arrange(Orthogroup, Species.Tree.Node)
+    return(both_genes)
+}
+
+one_to_one_orthologs <- filter_orthologs_pairs(duplications_long, 'Sobic', 'Bradi')
+one_to_one_orthologs
+
+filter_orthologs_pairs_wide <- function(df, species1, species2) {
+    one_to_one_orthologs <- filter_orthologs_pairs(df, species1, species2)
+
+    tmp1 <- filter(one_to_one_orthologs, Species == species1) %>%
+        mutate(sobic_gene=Gene) %>%
+        select(-Gene, -Species)
+
+    tmp2 <- filter(one_to_one_orthologs, Species == species2) %>%
+        mutate(bradi_gene=Gene) %>%
+        select(-Gene, -Species)
+
+    one_to_one_orthologs_wide <- tmp1 %>%
+        full_join(tmp2, by=c("Orthogroup", "Species.Tree.Node", "Type", "N.Genes")) %>%
+        select(-N.Genes, -Type) %>%
+        ungroup %>%
+        arrange(Species.Tree.Node, Orthogroup)
+
+    return(one_to_one_orthologs_wide)
+}
+
+sobic_brady_ortholog_pairs <- filter_orthologs_pairs_wide(duplications_long, 'Sobic', 'Bradi')
+sobic_brady_ortholog_pairs
+
+duplications_orthogroups
+
+# TODO should we also include high-confidence non-STRIDE ones? like 0.95+?
+orthogroups_definitely_branching_at <- function(species_tree_node_number)
+    duplications_orthogroups %>%
+    filter(node_number == species_tree_node_number, Type == 'Non-Terminal: STRIDE') %>%
+    .[['Orthogroup']]
+
+n_orthogroups_definitely_branching_at <- function(species_tree_node_number)
+    orthogroups_definitely_branching_at(species_tree_node_number) %>% length
+
+orthogroups_definitely_branching_at(2)
+
+# list all the branchpoints starting from zero
+n_species_nodes <- max(duplications_orthogroups$node_number, na.rm=T)
+branch_summary <- data.table(species_tree_node_number=seq(0,n_species_nodes)) %>% tbl_df
+branch_summary
+
+# count orthogroups branching at each one.
+# not sure why, but there's a dplyr error when trying to do this with mutate().
+# so i fell back to base r functions
+branch_summary$n_orthogroups_definitely_branching =
+    sapply(branch_summary$species_tree_node_number, n_orthogroups_definitely_branching_at)
+branch_summary
+
+n_confident <- sum(branch_summary$n_orthogroups_definitely_branching)
+n_total <- duplications_orthogroups$Orthogroup %>% unique %>% length
+fraction_confident <- n_confident / n_total
+
+fraction_confident
+
+#example_support_table <- read.csv('duplications-example-support-table.csv',
+#                                  sep=',', strip.white=T, header=T) %>% tbl_df
+#example_support_table
+
+support_table_long <-
+    duplications_long %>%
+    select(Orthogroup, Species.Tree.Node, Type, Gene, Support) %>%
+    filter(Type != 'Terminal') %>% # can be 'Non-Terminal' or 'Non-Terminal: STRIDE'
+    filter(grepl('^Sobic', Gene)) %>%
+    select(-Type) %>%
+    distinct
+
+support_table_long
+
+support_table <- reshape2::dcast(support_table_long,
+                                 Gene + Orthogroup ~ Species.Tree.Node, value.var='Support',
+                                 fill=0, fun=function(ns) round(max(ns), digits=2))
+support_table
+
+duplications_long %>% filter(Gene == 'Sobic.001G002400')
+
+sorghum_ids_table
+
+print("hooray!")
+
+write_tsv(support_table_long, 'support_table_long.tsv')
+write_tsv(support_table, 'support_table.tsv')
+write_tsv(one_to_n_orthologs, 'one_to_n_orthologs')
+write_tsv(one_to_n_orthologs, 'one_to_n_orthologs.tsv' )
+
+
